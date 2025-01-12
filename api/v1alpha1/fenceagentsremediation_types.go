@@ -81,13 +81,19 @@ type FenceAgentsRemediationSpec struct {
 	//+operator-sdk:csv:customresourcedefinitions:type=spec
 	Timeout metav1.Duration `json:"timeout,omitempty"`
 
-	// SharedParameters are passed to the fencing agent regardless of which node is about to be fenced (i.e., they are common for all the nodes)
+	// SharedParameters are passed to the fencing agent regardless of which node is about to be fenced
+	// (i.e., they are common for all the nodes)
 	//+operator-sdk:csv:customresourcedefinitions:type=spec
 	SharedParameters map[ParameterName]string `json:"sharedparameters,omitempty"`
 
 	// NodeParameters are passed to the fencing agent according to the node that is fenced, since they are node specific
 	//+operator-sdk:csv:customresourcedefinitions:type=spec
 	NodeParameters map[ParameterName]map[NodeName]string `json:"nodeparameters,omitempty"`
+
+	// CredentialParameters are passed to the fencing agent according to the node that is fenced, and the parameters
+	// values are fetched from a known secret
+	//+operator-sdk:csv:customresourcedefinitions:type=spec
+	CredentialParameters []ParameterName `json:"credentialparameters,omitempty"`
 
 	// RemediationStrategy is the remediation method for unhealthy nodes.
 	// Currently, it could be either "OutOfServiceTaint" or "ResourceDeletion".
