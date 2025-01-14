@@ -132,13 +132,13 @@ func (r *FenceAgentsRemediationReconciler) Reconcile(ctx context.Context, req ct
 		return emptyResult, err
 	}
 
-	// Check NHC timeout annotation
-	if isTimedOutByNHC(far) {
+	// Check NHC timeout annotation and stop the agent, since remediation is no longer relevant (most likely because fixed by a different remediator)
+	if r.Executor.Exists(far.GetUID()) && isTimedOutByNHC(far) {
 		r.Log.Info(utils.EventMessageRemediationStoppedByNHC)
-		r.Executor.Remove(far.GetUID())
+		r.stopAgentAndGetCrConditionsStatus(far, node.Name)
 		utils.UpdateConditions(utils.RemediationInterruptedByNHC, far, r.Log)
 		commonEvents.RemediationStoppedByNHC(r.Recorder, far)
-		return emptyResult, err
+		return requeueImmediately, nil
 	}
 
 	// Add finalizer when the CR is created
@@ -158,12 +158,7 @@ func (r *FenceAgentsRemediationReconciler) Reconcile(ctx context.Context, req ct
 		r.Log.Info("CR's deletion timestamp is not zero, and FAR finalizer exists", "CR Name", req.Name)
 
 		if !meta.IsStatusConditionPresentAndEqual(far.Status.Conditions, commonConditions.SucceededType, metav1.ConditionTrue) {
-			processingCondition := meta.FindStatusCondition(far.Status.Conditions, commonConditions.ProcessingType).Status
-			fenceAgentActionSucceededCondition := meta.FindStatusCondition(far.Status.Conditions, utils.FenceAgentActionSucceededType).Status
-			succeededCondition := meta.FindStatusCondition(far.Status.Conditions, commonConditions.SucceededType).Status
-			r.Log.Info("FAR didn't finish remediate the node ", "CR Name", req.Name, "processing condition", processingCondition,
-				"fenceAgentActionSucceeded condition", fenceAgentActionSucceededCondition, "succeeded condition", succeededCondition)
-			r.Executor.Remove(far.GetUID())
+			r.stopAgentAndGetCrConditionsStatus(far, node.Name)
 		}
 
 		// remove out-of-service taint when using OutOfServiceTaint remediation
@@ -179,11 +174,11 @@ func (r *FenceAgentsRemediationReconciler) Reconcile(ctx context.Context, req ct
 					return emptyResult, err
 				}
 			}
-			r.Log.Info("out-of-service taint was removed", "Node Name", req.Name)
+			r.Log.Info("out-of-service taint was removed", "Node Name", node.Name)
 			commonEvents.NormalEvent(r.Recorder, node, utils.EventReasonRemoveOutOfServiceTaint, utils.EventMessageRemoveOutOfServiceTaint)
 		}
 
-		// remove node's taints
+		// remove FAR remediation taint
 		taint := utils.CreateRemediationTaint()
 		if err := utils.RemoveTaint(r.Client, node.Name, taint); err != nil {
 			if apiErrors.IsConflict(err) {
@@ -203,7 +198,7 @@ func (r *FenceAgentsRemediationReconciler) Reconcile(ctx context.Context, req ct
 		if err := r.Client.Update(context.Background(), far); err != nil {
 			return emptyResult, fmt.Errorf("failed to remove finalizer from CR - %w", err)
 		}
-		r.Log.Info("Finalizer was removed", "CR Name", req.Name)
+		r.Log.Info("FAR Finalizer was removed", "CR Name", far.Name)
 		commonEvents.NormalEvent(r.Recorder, far, utils.EventReasonRemoveFinalizer, utils.EventMessageRemoveFinalizer)
 		return emptyResult, nil
 	}
@@ -281,6 +276,16 @@ func (r *FenceAgentsRemediationReconciler) Reconcile(ctx context.Context, req ct
 	}
 
 	return emptyResult, nil
+}
+
+// stopAgentAndGetCrStatus log FAR CR status and stops the agent's parallel execution
+func (r *FenceAgentsRemediationReconciler) stopAgentAndGetCrConditionsStatus(far *v1alpha1.FenceAgentsRemediation, nodeName string) {
+	processingCondition := meta.FindStatusCondition(far.Status.Conditions, commonConditions.ProcessingType).Status
+	fenceAgentActionSucceededCondition := meta.FindStatusCondition(far.Status.Conditions, utils.FenceAgentActionSucceededType).Status
+	succeededCondition := meta.FindStatusCondition(far.Status.Conditions, commonConditions.SucceededType).Status
+	r.Log.Info("FAR agent was stopped", "Node Name", nodeName, "Agent Name", far.Spec.Agent, "processing condition", processingCondition,
+		"fenceAgentActionSucceeded condition", fenceAgentActionSucceededCondition, "succeeded condition", succeededCondition)
+	r.Executor.Remove(far.GetUID())
 }
 
 // isTimedOutByNHC checks if NHC set a timeout annotation on the CR
