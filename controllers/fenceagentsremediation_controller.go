@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -28,6 +29,7 @@ import (
 	commonEvents "github.com/medik8s/common/pkg/events"
 	commonResources "github.com/medik8s/common/pkg/resources"
 
+	corev1 "k8s.io/api/core/v1"
 	apiErrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,12 +48,14 @@ import (
 
 const (
 	// errors
-	errorMissingParams     = "nodeParameters or sharedParameters or both are missing, and they cannot be empty"
-	errorMissingNodeParams = "node parameter is required, and cannot be empty"
+	errorMissingParams      = "nodeParameters or sharedParameters or both are missing, and they cannot be empty"
+	errorMissingNodeParams  = "node parameter is required, and cannot be empty"
+	errorFailFetchingSecret = "failed to fetch secret key `%s` from secret `%s` at namespace `%s`: %w"
 
 	SuccessFAResponse    = "Success: Rebooted"
 	parameterActionName  = "--action"
 	parameterActionValue = "reboot"
+	DefaultSecretName    = "defaultSecret"
 )
 
 // FenceAgentsRemediationReconciler reconciles a FenceAgentsRemediation object
@@ -73,6 +77,7 @@ func (r *FenceAgentsRemediationReconciler) SetupWithManager(mgr ctrl.Manager) er
 //+kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch;delete
 //+kubebuilder:rbac:groups=core,resources=pods/exec,verbs=create
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;update;delete;deletecollection
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;delete
 //+kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 //+kubebuilder:rbac:groups=fence-agents-remediation.medik8s.io,resources=fenceagentsremediations,verbs=get;list;watch;create;update;patch;delete
@@ -226,14 +231,15 @@ func (r *FenceAgentsRemediationReconciler) Reconcile(ctx context.Context, req ct
 		}
 
 		r.Log.Info("Build fence agent command line", "Fence Agent", far.Spec.Agent, "Node Name", node.Name)
-		faParams, err := buildFenceAgentParams(far)
+		faParams, err := buildFenceAgentParams(far, ctx, r.Client)
 		if err != nil {
-			r.Log.Error(err, "Invalid shared or node parameters from CR", "Node Name", node.Name, "CR Name", req.Name)
+			r.Log.Error(err, "Invalid credential/shared/node parameter from CR", "Node Name", node.Name, "CR Name", req.Name)
 			return emptyResult, nil
 		}
 
 		cmd := append([]string{far.Spec.Agent}, faParams...)
-		r.Log.Info("Execute the fence agent", "Fence Agent", far.Spec.Agent, "Node Name", node.Name, "FAR uid", far.GetUID())
+		//TODO remove the below change after testing
+		r.Log.Info("Execute the fence agent", "Fence Agent", far.Spec.Agent, "Node Name", node.Name, "FAR uid", far.GetUID(), "command", cmd)
 		r.Executor.AsyncExecute(ctx, far.GetUID(), cmd, far.Spec.RetryCount, far.Spec.RetryInterval.Duration, far.Spec.Timeout.Duration)
 		commonEvents.NormalEvent(r.Recorder, far, utils.EventReasonFenceAgentExecuted, utils.EventMessageFenceAgentExecuted)
 		return emptyResult, nil
@@ -248,7 +254,7 @@ func (r *FenceAgentsRemediationReconciler) Reconcile(ctx context.Context, req ct
 		switch far.Spec.RemediationStrategy {
 		case v1alpha1.ResourceDeletionRemediationStrategy, "":
 			// Basically RemediationStrategy should be set to ResourceDeletion strategy as the default strategy.
-			// However it will be empty when the CS was created when ResourceDeletion strategy was the only strategy.
+			// However, it will be empty when the CS was created when ResourceDeletion strategy was the only strategy.
 			// In this case, the empty strategy should be treated as if ResourceDeletion strategy selected.
 			r.Log.Info("Remediation strategy is ResourceDeletion which explicitly deletes resources - manually deleting workload", "Node Name", req.Name)
 			commonEvents.NormalEvent(r.Recorder, node, utils.EventReasonDeleteResources, utils.EventMessageDeleteResources)
@@ -337,9 +343,51 @@ func getNodeName(far *v1alpha1.FenceAgentsRemediation) string {
 	return far.GetName()
 }
 
+// fetchSecret fetches a secret and returns an error on failure
+func fetchSecret(ctx context.Context, c client.Client, secretKeyObj client.ObjectKey) (*corev1.Secret, error) {
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, secretKeyObj, secret); err != nil {
+		return nil, err
+	}
+	return secret, nil
+}
+
+// resolveParameterValueFromSecret resolve parameter value from secret if exist, otherwise returns an error
+func resolveParameterValueFromSecret(ctx context.Context, c client.Client, far *v1alpha1.FenceAgentsRemediation, paramName v1alpha1.ParameterName) (string, error) {
+	var secret *corev1.Secret
+	var err error
+	logger := ctrl.Log.WithName("resolve-value-from-secret")
+	secretName := far.Name
+	// fetch secret/node name from remediation's annotation if present
+	if annotatedName, exist := far.Annotations["remediation.medik8s.io/node-name"]; exist {
+		secretName = annotatedName
+	}
+	secret, err = fetchSecret(ctx, c, client.ObjectKey{Name: secretName, Namespace: far.Namespace})
+	if err != nil {
+		if apiErrors.IsNotFound(err) {
+			// when there is no specefic secret, then we try the default secret
+			logger.Info("secret is missing - try default secret", "secret name", secretName, "default secret", DefaultSecretName, "namespace", far.Namespace, "paramter mame", string(paramName))
+			secretName = DefaultSecretName
+			secret, err = fetchSecret(ctx, c, client.ObjectKey{Name: secretName, Namespace: far.Namespace})
+		}
+		if err != nil {
+			logger.Error(err, "failed to fetch secret", "secret name", secretName, "namespace", far.Namespace)
+			return "", fmt.Errorf(errorFailFetchingSecret, paramName, secretName, far.Namespace, err)
+		}
+	}
+	// Extract the secret value
+	secretValue, exists := secret.Data[string(paramName)]
+	if !exists {
+		return "", fmt.Errorf("secret key `%s` was not found in secret `%s` at namespace `%s`", paramName, secretName, far.Namespace)
+	}
+	logger.Info("found a value from secret", "secret name", secretName, "paramter mame", string(paramName), "secret value", secretValue)
+
+	return string(secretValue), nil
+}
+
 // buildFenceAgentParams collects the FAR's parameters for the node based on FAR CR, and if the CR is missing parameters
-// or the CR's name don't match nodeParameter name or it has an action which is different than reboot, then return an error
-func buildFenceAgentParams(far *v1alpha1.FenceAgentsRemediation) ([]string, error) {
+// or the CR's name don't match nodeParameter name, or it has an action which is different from reboot, then return an error
+func buildFenceAgentParams(far *v1alpha1.FenceAgentsRemediation, ctx context.Context, c client.Client) ([]string, error) {
 	logger := ctrl.Log.WithName("build-fa-parameters")
 	if far.Spec.NodeParameters == nil || far.Spec.SharedParameters == nil {
 		err := errors.New(errorMissingParams)
@@ -347,42 +395,67 @@ func buildFenceAgentParams(far *v1alpha1.FenceAgentsRemediation) ([]string, erro
 		return nil, err
 	}
 	var fenceAgentParams []string
-	// add shared parameters except the action parameter
+	fenceAgentParamNames := make(map[v1alpha1.ParameterName]bool)
+
+	// append shared parameters
 	for paramName, paramVal := range far.Spec.SharedParameters {
-		if paramName != parameterActionName {
-			fenceAgentParams = appendParamToSlice(fenceAgentParams, paramName, paramVal)
-		} else if paramVal != parameterActionValue {
-			// --action attribute was selected but it is different than reboot
+		if paramName == parameterActionName && paramVal != parameterActionValue {
+			// --action parameter with a differnet value from reboot is not supported
 			err := errors.New("FAR doesn't support any other action than reboot")
 			logger.Error(err, "can't build CR with this action attribute", "action", paramVal)
 			return nil, err
+		} else if _, exist := fenceAgentParamNames[paramName]; !exist {
+			fenceAgentParamNames[paramName] = true
+			fenceAgentParams = appendParamToSlice(fenceAgentParams, paramName, paramVal)
 		}
 	}
-	// if --action attribute was not selected, then its default value is reboot
-	// https://github.com/ClusterLabs/fence-agents/blob/main/lib/fencing.py.py#L103
-	// Therefore we can safely add the reboot action regardless if it was initially added into the CR
-	fenceAgentParams = appendParamToSlice(fenceAgentParams, parameterActionName, parameterActionValue)
 
+	nodeName := getNodeName(far)
 	// append node parameters
-	nodeName := v1alpha1.NodeName(getNodeName(far))
 	for paramName, nodeMap := range far.Spec.NodeParameters {
-		if nodeVal, isFound := nodeMap[nodeName]; isFound {
-			fenceAgentParams = appendParamToSlice(fenceAgentParams, paramName, nodeVal)
+		if nodeVal, isFound := nodeMap[v1alpha1.NodeName(nodeName)]; isFound {
+			if _, exist := fenceAgentParamNames[paramName]; !exist {
+				fenceAgentParamNames[paramName] = true
+				fenceAgentParams = appendParamToSlice(fenceAgentParams, paramName, nodeVal)
+			}
 		} else {
 			err := errors.New(errorMissingNodeParams)
 			logger.Error(err, "Missing matching nodeParam and CR's name")
 			return nil, err
 		}
 	}
+
+	// append credential parameters
+	for _, paramName := range far.Spec.CredentialParameters {
+		resolvedVal, err := resolveParameterValueFromSecret(ctx, c, far, paramName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve credential parameter: %w", err)
+		} else {
+			if _, exist := fenceAgentParamNames[paramName]; !exist {
+				fenceAgentParamNames[paramName] = true
+				fenceAgentParams = appendParamToSlice(fenceAgentParams, paramName, resolvedVal)
+			}
+		}
+	}
+
+	// Add the reboot action with its default value - https://github.com/ClusterLabs/fence-agents/blob/main/lib/fencing.py.py#L103
+	if _, exist := fenceAgentParamNames[parameterActionName]; !exist {
+		logger.Info("`action` parameter is missing, so we add it with the default value of `reboot`")
+		fenceAgentParams = appendParamToSlice(fenceAgentParams, parameterActionName, parameterActionValue)
+	}
 	return fenceAgentParams, nil
 }
 
 // appendParamToSlice appends parameters in a key-value manner, when value can be empty
 func appendParamToSlice(fenceAgentParams []string, paramName v1alpha1.ParameterName, paramVal string) []string {
+	stringParam := string(paramName)
+	if !strings.HasPrefix(stringParam, "--") {
+		stringParam = "--" + stringParam
+	}
 	if paramVal != "" {
-		fenceAgentParams = append(fenceAgentParams, fmt.Sprintf("%s=%s", paramName, paramVal))
+		fenceAgentParams = append(fenceAgentParams, fmt.Sprintf("%s=%s", stringParam, paramVal))
 	} else {
-		fenceAgentParams = append(fenceAgentParams, string(paramName))
+		fenceAgentParams = append(fenceAgentParams, stringParam)
 	}
 	return fenceAgentParams
 }

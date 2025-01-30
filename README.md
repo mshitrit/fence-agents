@@ -187,6 +187,7 @@ The FAR CR, `FenceAgentsRemediation`, is created by the admin and is used to tri
 The CR includes the following parameters:
 
 * `agent` - fence agent name. File name which is validated (by kubebuilder and Webhook) against a list of supported agents in the FAR pod.
+* `credentialarameters` - credential parameters for accessing the node to be remediated.
 * `sharedparameters` - cluster wide parameters for executing the fence agent.
 * `nodeparameters` - node specific parameters for executing the fence agent.
 * `retrycount` - number of times to retry the fence agent in case of failure. The default is 5.
@@ -209,9 +210,10 @@ spec:
   retrycount: 5
   retryinterval: "5s"
   timeout: "60s"
+  credentialparameters:
+    --password
   sharedparameters:
     --username: "admin"
-    --password: "password"
     --lanplus: ""
     --action: "reboot"
     --ip: "192.168.111.1"
@@ -223,7 +225,7 @@ spec:
       worker-0: "6233"
       worker-1: "6234"
       worker-2: "6235"
-  remediationStrategy: ResourceDeletion
+  remediationStrategy: OutOfServiceTaint
 ```
 
 ## Tests
