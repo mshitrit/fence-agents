@@ -96,6 +96,47 @@ var _ = Describe("FAR Controller", func() {
 		})
 
 		Context("buildFenceAgentParams", func() {
+			Context("build fence agent params", func() {
+				baseShareParam := map[v1alpha1.ParameterName]string{
+					"--username": "admin",
+					"--password": "password",
+					"--ip":       "192.168.111.1",
+					"--lanplus":  "",
+				}
+				testCases := []struct {
+					name   string
+					action string
+					expect error
+				}{
+					{"reboot action", "reboot", nil},
+					{"off action", "off", nil},
+					{"unsupported action", "cycle", errors.New(errorUnsupportedAction)},
+				}
+
+				for _, tc := range testCases {
+					When(fmt.Sprintf("FAR includes %s", tc.name), func() {
+						It("should return expected result", func() {
+							shareParam := baseShareParam
+							shareParam["--action"] = tc.action
+							far := getFenceAgentsRemediation(workerNode, fenceAgentIPMI, shareParam, testNodeParam)
+							shareString, err := buildFenceAgentParams(far)
+							if tc.expect == nil {
+								Expect(err).NotTo(HaveOccurred())
+								Expect(shareString).To(ConsistOf([]string{
+									"--lanplus",
+									"--password=password",
+									"--username=admin",
+									fmt.Sprintf("--action=%s", tc.action),
+									"--ip=192.168.111.1",
+									"--ipport=6233"}))
+							} else {
+								Expect(err).To(HaveOccurred())
+								Expect(err).To(Equal(tc.expect))
+							}
+						})
+					})
+				}
+			})
 			When("FAR include different action than reboot", func() {
 				It("should succeed with a warning", func() {
 					invalidValTestFAR := getFenceAgentsRemediation(workerNode, fenceAgentIPMI, invalidShareParam, testNodeParam, v1alpha1.ResourceDeletionRemediationStrategy)

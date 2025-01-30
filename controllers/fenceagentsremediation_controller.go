@@ -48,10 +48,12 @@ const (
 	// errors
 	errorMissingParams     = "nodeParameters or sharedParameters or both are missing, and they cannot be empty"
 	errorMissingNodeParams = "node parameter is required, and cannot be empty"
+	errorUnsupportedAction = "FAR doesn't support any other action than reboot and off"
 
-	SuccessFAResponse    = "Success: Rebooted"
-	parameterActionName  = "--action"
-	parameterActionValue = "reboot"
+	SuccessFAResponse          = "Success: Rebooted"
+	parameterActionName        = "--action"
+	parameterRebootActionValue = "reboot"
+	parameterOffActionValue    = "off"
 )
 
 // FenceAgentsRemediationReconciler reconciles a FenceAgentsRemediation object
@@ -338,9 +340,10 @@ func getNodeName(far *v1alpha1.FenceAgentsRemediation) string {
 }
 
 // buildFenceAgentParams collects the FAR's parameters for the node based on FAR CR, and if the CR is missing parameters
-// or the CR's name don't match nodeParameter name or it has an action which is different than reboot, then return an error
+// or the CR's name don't match nodeParameter name or it has an action which is different than reboot and off, then return an error
 func buildFenceAgentParams(far *v1alpha1.FenceAgentsRemediation) ([]string, error) {
 	logger := ctrl.Log.WithName("build-fa-parameters")
+	parameterActionValue := parameterRebootActionValue
 	if far.Spec.NodeParameters == nil || far.Spec.SharedParameters == nil {
 		err := errors.New(errorMissingParams)
 		logger.Error(err, "Missing parameters")
@@ -351,11 +354,16 @@ func buildFenceAgentParams(far *v1alpha1.FenceAgentsRemediation) ([]string, erro
 	for paramName, paramVal := range far.Spec.SharedParameters {
 		if paramName != parameterActionName {
 			fenceAgentParams = appendParamToSlice(fenceAgentParams, paramName, paramVal)
-		} else if paramVal != parameterActionValue {
-			// --action attribute was selected but it is different than reboot
-			err := errors.New("FAR doesn't support any other action than reboot")
-			logger.Error(err, "can't build CR with this action attribute", "action", paramVal)
-			return nil, err
+		} else {
+			switch paramVal {
+			case parameterRebootActionValue, parameterOffActionValue:
+				parameterActionValue = paramVal
+			default:
+				// --action attribute was selected but it is different than reboot and off
+				err := errors.New(errorUnsupportedAction)
+				logger.Error(err, "can't build CR with this action attribute", "action", paramVal)
+				return nil, err
+			}
 		}
 	}
 	// if --action attribute was not selected, then its default value is reboot
